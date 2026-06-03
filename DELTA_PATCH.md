@@ -1,18 +1,46 @@
-# Weekly delta patch (`mateo/weekly-delta`)
+# Patch reference (`mateo/weekly-delta`)
 
-Adds a small "▲ X%" / "▼ X%" indicator to the Weekly panel showing how this
+For setup/install/troubleshooting see [SETUP.md](SETUP.md). This file is the
+technical reference for what the three patch commits actually change.
+
+## 1. Weekly delta indicator
+
+Adds a small "▲ X%" / "▼ X%" next to the Weekly reset line showing how this
 week's token usage compares to the previous 7 days. Anthropic's rate-limit
 headers only expose current-window utilization, so the delta is computed on
 the daemon side by aggregating Claude Code's local JSONL session logs at
 `~/.claude/projects/**/*.jsonl`. Hidden until prev-7d data exists.
-
-## What changed
 
 ```
 daemon/claude_usage_daemon.py     +110 lines  (JsonlAggregator + payload fields)
 firmware/src/data.h                 +5 lines  (delta_pct, has_delta)
 firmware/src/main.cpp               +4 lines  (parse "dp"/"hd" from JSON)
 firmware/src/ui.cpp                +28 lines  (lbl_weekly_delta + render)
+```
+
+## 2. OAuth auto-refresh
+
+Claude Code's access tokens expire ~8h after issuance and the CLI only
+refreshes them lazily on the next API call — so the stock daemon 401s for
+hours when you haven't touched `claude` recently. This patch detects expiry
+(5-min margin), exchanges the refreshToken at
+`https://console.anthropic.com/v1/oauth/token` (client_id
+`9d1c250a-e61b-44d9-88ed-5944d1962f5e`, the public Claude Code default),
+and writes the new triple back to the same credential store we read from.
+
+```
+daemon/claude_usage_daemon.py     +156 lines  (get_fresh_token + helpers)
+```
+
+## 3. Font merge for ▲/▼
+
+Styrene Regular doesn't include U+25B2/U+25BC, so the delta arrows rendered
+as tofu rectangles. `font_styrene_24.c` was regenerated with two source
+fonts merged: Styrene for ASCII, DejaVu Sans Mono for just the two triangle
+codepoints. Regen recipe in the commit message.
+
+```
+firmware/src/font_styrene_24.c     +77 lines
 ```
 
 Layout-aware: the delta label is positioned at `L.usage_reset_y + 3` so it
@@ -39,13 +67,13 @@ cd ~/Desktop/clawdmeter
 
 # 1. Stock first — confirm board boots and pairs.
 git checkout main
-./flash-mac.sh -e waveshare_amoled_216_c6        # auto-detects /dev/cu.usbmodem*
+./flash-mac.sh waveshare_amoled_216_c6        # auto-detects /dev/cu.usbmodem*
 # pair via System Settings → Bluetooth ("Clawdmeter")
 ./install-mac.sh                                  # installs daemon + LaunchAgent
 
 # 2. Apply the patch.
 git checkout mateo/weekly-delta
-./flash-mac.sh -e waveshare_amoled_216_c6
+./flash-mac.sh waveshare_amoled_216_c6
 launchctl unload ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist
 launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist
 ```
@@ -57,7 +85,7 @@ so a `git checkout` is enough — no symlink shuffling.
 
 ```bash
 git checkout main
-./flash-mac.sh -e waveshare_amoled_216_c6
+./flash-mac.sh waveshare_amoled_216_c6
 launchctl unload ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist
 launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist
 ```
