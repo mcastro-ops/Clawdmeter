@@ -111,6 +111,10 @@ static bool parse_json(const char* json, UsageData* out) {
     out->weekly_reset_mins = doc["wr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->ok = doc["ok"] | false;
+    // mateo/weekly-delta: optional fields, daemon omits them until a full
+    // previous week of JSONL data exists.
+    out->has_delta = doc["hd"] | false;
+    out->delta_pct = doc["dp"] | 0.0f;
     out->valid = true;
     return true;
 }

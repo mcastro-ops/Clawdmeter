@@ -9,4 +9,9 @@ struct UsageData {
     char status[16];         // "allowed" or "limited"
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
+    // mateo/weekly-delta patch: percent change vs previous 7d, computed by the
+    // daemon from local Claude Code JSONL logs (the API headers don't expose
+    // history). Null/missing for the first week of use.
+    float delta_pct;
+    bool has_delta;
 };

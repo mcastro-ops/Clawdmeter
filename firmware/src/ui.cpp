@@ -112,6 +112,7 @@ static lv_obj_t* bar_weekly;
 static lv_obj_t* lbl_weekly_pct;
 static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
+static lv_obj_t* lbl_weekly_delta;  // mateo/weekly-delta: ▲/▼ X% vs prev 7d
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
 // ---- Battery indicator (shared, on top) ----
@@ -357,6 +358,17 @@ static void init_usage_screen(lv_obj_t* scr) {
                      &lbl_weekly_pct, &lbl_weekly_label,
                      &bar_weekly, &lbl_weekly_reset);
 
+    // mateo/weekly-delta: right-aligned "▲ X%" / "▼ X%" on the Weekly reset
+    // row. Lives inside the weekly panel (parent of lbl_weekly_reset) so
+    // padding aligns with the rest of the card. Hidden until daemon sends
+    // a hd:true payload (i.e. prev-7d JSONL data exists).
+    lbl_weekly_delta = lv_label_create(lv_obj_get_parent(lbl_weekly_reset));
+    lv_label_set_text(lbl_weekly_delta, "");
+    lv_obj_set_style_text_font(lbl_weekly_delta, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_weekly_delta, COL_DIM, 0);
+    lv_obj_align(lbl_weekly_delta, LV_ALIGN_TOP_RIGHT, 0, L.usage_reset_y + 3);
+    lv_obj_add_flag(lbl_weekly_delta, LV_OBJ_FLAG_HIDDEN);
+
     build_pair_group(usage_container);
 
     // Status line — always visible on the usage view. Driven by ui_tick_anim().
@@ -415,6 +427,21 @@ void ui_update(const UsageData* data) {
 
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
+
+    // mateo/weekly-delta: ▲ amber for more usage than last week, ▼ green for
+    // less. Clamps the display at ±999% to avoid layout blowout.
+    if (data->has_delta) {
+        int dp = (int)(data->delta_pct + (data->delta_pct >= 0 ? 0.5f : -0.5f));
+        if (dp > 999) dp = 999;
+        if (dp < -999) dp = -999;
+        const char* arrow = (data->delta_pct >= 0) ? "\xE2\x96\xB2" : "\xE2\x96\xBC"; // ▲ / ▼
+        lv_color_t col = (data->delta_pct >= 0) ? COL_AMBER : COL_GREEN;
+        lv_label_set_text_fmt(lbl_weekly_delta, "%s %d%%", arrow, dp < 0 ? -dp : dp);
+        lv_obj_set_style_text_color(lbl_weekly_delta, col, 0);
+        lv_obj_clear_flag(lbl_weekly_delta, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(lbl_weekly_delta, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void ui_tick_anim(void) {
