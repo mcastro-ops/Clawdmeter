@@ -129,6 +129,160 @@ def read_token() -> str | None:
     return _read_token_file()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# OAuth token refresh. Anthropic's Claude Code access tokens expire after
+# ~8h; Claude Code refreshes them lazily on next API call. The stock
+# daemon doesn't refresh, so it 401s for hours when the user hasn't
+# touched `claude` recently. This block proactively renews via the
+# refresh_token grant against the Console OAuth endpoint, then writes
+# the new triple (access/refresh/expiresAt) back to whichever credential
+# store we read from.
+#
+# Endpoint and client_id are the public Claude Code defaults — same ones
+# the official CLI uses.
+# ──────────────────────────────────────────────────────────────────────────
+OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+TOKEN_REFRESH_MARGIN_S = 300   # refresh if access token expires within 5 min
+
+
+def _read_credential_blob() -> dict | None:
+    """Return the *full* parsed credentials dict (not just the access token)."""
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", KEYCHAIN_SERVICE,
+                 "-a", getpass.getuser(), "-w"],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            raw = out.stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError,
+                subprocess.TimeoutExpired) as e:
+            log(f"Keychain read failed: {e}")
+            return None
+    else:
+        try:
+            raw = CREDENTIALS_PATH.read_text().strip()
+        except OSError as e:
+            log(f"Credentials file read failed: {e}")
+            return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _write_credential_blob(blob: dict) -> bool:
+    """Persist the updated credential blob to the same store we read from."""
+    payload = json.dumps(blob, separators=(",", ":"))
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["security", "add-generic-password", "-U",
+                 "-s", KEYCHAIN_SERVICE,
+                 "-a", getpass.getuser(),
+                 "-w", payload],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            log(f"Keychain write failed (rc={e.returncode}): {e.stderr.strip()}")
+            return False
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log(f"Keychain write error: {e}")
+            return False
+    try:
+        CREDENTIALS_PATH.write_text(payload)
+        return True
+    except OSError as e:
+        log(f"Credentials file write failed: {e}")
+        return False
+
+
+async def _refresh_oauth(refresh_token: str) -> dict | None:
+    """POST to Anthropic's OAuth token endpoint. Returns the JSON response
+    on 2xx, None otherwise.
+    """
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_CODE_CLIENT_ID,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp = await http.post(
+                OAUTH_TOKEN_URL,
+                json=body,
+                headers={"Content-Type": "application/json"},
+            )
+    except httpx.HTTPError as e:
+        log(f"OAuth refresh failed: {e}")
+        return None
+    if resp.status_code >= 400:
+        log(f"OAuth refresh HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+    try:
+        return resp.json()
+    except json.JSONDecodeError:
+        log("OAuth refresh: response was not JSON")
+        return None
+
+
+async def get_fresh_token() -> str | None:
+    """Read credentials, proactively refresh if the access token is within
+    TOKEN_REFRESH_MARGIN_S of expiring, write the new tokens back, and
+    return the access token to use for this poll.
+    """
+    blob = _read_credential_blob()
+    if blob is None:
+        return None
+
+    # Locate the claudeAiOauth section (top-level or nested).
+    section = blob.get("claudeAiOauth") if isinstance(blob.get("claudeAiOauth"), dict) else blob
+    if not isinstance(section, dict):
+        return None
+
+    access = section.get("accessToken")
+    refresh = section.get("refreshToken")
+    expires_at_ms = section.get("expiresAt") or 0
+    expires_at_s = expires_at_ms / 1000.0 if expires_at_ms else 0
+    now = time.time()
+
+    if expires_at_s and now + TOKEN_REFRESH_MARGIN_S < expires_at_s:
+        # Fresh enough; use the cached access token.
+        return access
+
+    if not refresh:
+        log("Access token expired and no refresh_token present")
+        return access  # try once anyway — daemon will get 401 and back off
+
+    log(f"Access token expires in {int((expires_at_s - now)/60)} min; refreshing")
+    new_tokens = await _refresh_oauth(refresh)
+    if new_tokens is None:
+        return access  # fall back
+
+    new_access = new_tokens.get("access_token")
+    if not isinstance(new_access, str):
+        log("OAuth refresh: response missing access_token")
+        return access
+
+    # Persist. Anthropic always rotates the refresh_token; keep the old one
+    # if for some reason a new one isn't returned (shouldn't happen).
+    section["accessToken"] = new_access
+    if isinstance(new_tokens.get("refresh_token"), str):
+        section["refreshToken"] = new_tokens["refresh_token"]
+    expires_in = new_tokens.get("expires_in")
+    if isinstance(expires_in, (int, float)):
+        section["expiresAt"] = int((now + expires_in) * 1000)
+
+    if _write_credential_blob(blob):
+        log("Keychain updated with refreshed token")
+    return new_access
+
+
 def load_cached_address() -> str | None:
     if not SAVED_ADDR_FILE.exists():
         return None
@@ -480,7 +634,7 @@ async def connect_and_run(
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
-                token = read_token()
+                token = await get_fresh_token()
                 if not token:
                     log("No token; skipping poll")
                 else:
