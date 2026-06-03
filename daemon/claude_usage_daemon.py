@@ -29,11 +29,13 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
+WINDOW_7D_SECONDS = 7 * 24 * 60 * 60
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -271,7 +273,98 @@ async def discover_target(skip_addr: str | None = None):
     return address
 
 
-async def poll_api(token: str) -> dict | None:
+# ──────────────────────────────────────────────────────────────────────────
+# mateo/weekly-delta: JSONL-based delta vs previous 7d. Anthropic's rate-
+# limit headers expose the current weekly utilization but not the previous
+# week, so the "▲ X%" delta is computed from Claude Code's local session
+# logs at ~/.claude/projects/**/*.jsonl. Files are cached by mtime+size so
+# warm calls cost ~1 ms even with dozens of project dirs.
+# ──────────────────────────────────────────────────────────────────────────
+class JsonlAggregator:
+    def __init__(self) -> None:
+        # path -> (mtime_ns, size, [(ts_seconds, token_sum), ...])
+        self._cache: dict[Path, tuple[int, int, list[tuple[float, int]]]] = {}
+
+    def _list_files(self) -> list[Path]:
+        if not PROJECTS_DIR.exists():
+            return []
+        return list(PROJECTS_DIR.rglob("*.jsonl"))
+
+    def _parse_file(self, path: Path) -> list[tuple[float, int]]:
+        records: list[tuple[float, int]] = []
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            return records
+        for line in text.splitlines():
+            if not line or '"usage"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "assistant":
+                continue
+            msg = obj.get("message")
+            if not isinstance(msg, dict):
+                continue
+            usage = msg.get("usage")
+            ts_str = obj.get("timestamp")
+            if not isinstance(usage, dict) or not ts_str:
+                continue
+            try:
+                ts = time.mktime(time.strptime(ts_str[:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                continue
+            total = (
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("output_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+            )
+            if total > 0:
+                records.append((ts, total))
+        return records
+
+    def _records(self) -> list[tuple[float, int]]:
+        files = self._list_files()
+        live = set(files)
+        for stale in list(self._cache.keys()):
+            if stale not in live:
+                self._cache.pop(stale, None)
+        all_records: list[tuple[float, int]] = []
+        for f in files:
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            cached = self._cache.get(f)
+            if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                all_records.extend(cached[2])
+                continue
+            parsed = self._parse_file(f)
+            self._cache[f] = (st.st_mtime_ns, st.st_size, parsed)
+            all_records.extend(parsed)
+        return all_records
+
+    def delta_pct(self) -> float | None:
+        """Percent change current-7d vs previous-7d, or None if prev is 0."""
+        now = time.time()
+        cutoff_now = now - WINDOW_7D_SECONDS
+        cutoff_prev = cutoff_now - WINDOW_7D_SECONDS
+        cur_sum = 0
+        prev_sum = 0
+        for ts, total in self._records():
+            if ts >= cutoff_now:
+                cur_sum += total
+            elif ts >= cutoff_prev:
+                prev_sum += total
+        if prev_sum <= 0:
+            return None
+        return (cur_sum - prev_sum) / prev_sum * 100.0
+
+
+async def poll_api(token: str, aggregator: "JsonlAggregator | None" = None) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
     try:
@@ -311,6 +404,16 @@ async def poll_api(token: str) -> dict | None:
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
         "ok": True,
     }
+    # mateo/weekly-delta: augment with JSONL-derived delta vs previous 7d.
+    if aggregator is not None:
+        try:
+            dp = aggregator.delta_pct()
+        except Exception as e:
+            log(f"Delta aggregation failed: {e}")
+            dp = None
+        if dp is not None:
+            payload["dp"] = round(dp, 1)
+            payload["hd"] = True
     return payload
 
 
@@ -340,7 +443,11 @@ class Session:
             return False
 
 
-async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
+async def connect_and_run(
+    target,
+    stop_event: asyncio.Event,
+    aggregator: JsonlAggregator,
+) -> bool:
     """Connect to a target and poll until disconnected or stopped.
 
     ``target`` is either an address string (Linux) or a BLEDevice carrying
@@ -377,7 +484,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                 if not token:
                     log("No token; skipping poll")
                 else:
-                    payload = await poll_api(token)
+                    payload = await poll_api(token, aggregator)
                     if payload is not None:
                         if await session.write_payload(payload):
                             last_poll = time.time()
@@ -414,6 +521,9 @@ async def main() -> None:
     log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
 
+    # mateo/weekly-delta: persistent JSONL aggregator (mtime-cached).
+    aggregator = JsonlAggregator()
+
     backoff = 1
     skip_addr: str | None = None  # macOS: a peripheral to skip for one cycle
     while not stop_event.is_set():
@@ -431,7 +541,7 @@ async def main() -> None:
             continue
 
         addr = target if isinstance(target, str) else target.address
-        ok = await connect_and_run(target, stop_event)
+        ok = await connect_and_run(target, stop_event, aggregator)
         if not ok:
             if sys.platform == "darwin":
                 # No string cache to drop; instead skip this stale handle on
