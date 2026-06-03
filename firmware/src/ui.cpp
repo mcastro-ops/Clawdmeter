@@ -428,8 +428,10 @@ void ui_update(const UsageData* data) {
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
 
-    // mateo/weekly-delta: ▲ amber for more usage than last week, ▼ green for
-    // less. Clamps the display at ±999% to avoid layout blowout.
+    // mateo/weekly-delta: ▲ amber for more usage than last week, ▼ green
+    // for less. font_styrene_24 was regenerated with DejaVu fallback for
+    // U+25B2/U+25BC since Styrene Regular doesn't include those glyphs.
+    // Clamps the display at ±999% to avoid layout blowout.
     if (data->has_delta) {
         int dp = (int)(data->delta_pct + (data->delta_pct >= 0 ? 0.5f : -0.5f));
         if (dp > 999) dp = 999;
