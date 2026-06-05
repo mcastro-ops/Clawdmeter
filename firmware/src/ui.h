@@ -5,6 +5,7 @@
 enum screen_t {
     SCREEN_SPLASH,
     SCREEN_USAGE,
+    SCREEN_INFO,    // clock + stats, shown after 60s of touch inactivity
     SCREEN_COUNT,
 };
 

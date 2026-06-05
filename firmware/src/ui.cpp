@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "splash.h"
 #include <lvgl.h>
+#include <time.h>
 #include "logo.h"
 #include "icons.h"
 #include "hal/board_caps.h"
@@ -114,6 +115,23 @@ static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
 static lv_obj_t* lbl_weekly_delta;  // mateo/weekly-delta: ▲/▼ X% vs prev 7d
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
+
+// ---- Info screen widgets (mateo/info-screen — clock + stats) ----
+static lv_obj_t* info_container;
+static lv_obj_t* lbl_clock;
+static lv_obj_t* lbl_date;
+static lv_obj_t* lbl_info_week_v;
+static lv_obj_t* lbl_info_today_v;
+static lv_obj_t* lbl_info_wcost_v;
+static lv_obj_t* lbl_info_streak_v;
+static lv_obj_t* lbl_info_hint;
+// Idle→info trigger: switch to SCREEN_INFO after this many ms with no touch.
+#define INFO_IDLE_TIMEOUT_MS  60000UL
+static uint32_t last_user_touch_ms = 0;
+// Local TZ offset in seconds, set from each payload's `tz` field (minutes).
+// settimeofday() puts the device on UTC; refresh_info_clock adds this to
+// derive local wall-clock for display.
+static long g_tz_offset_seconds = 0;
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -379,6 +397,82 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
 }
 
+// mateo/info-screen: the idle clock view. Same header (logo + battery) as
+// the Usage screen, then big clock + date + 4-row stats panel + idle hint.
+// Activated automatically after INFO_IDLE_TIMEOUT_MS of no touch on
+// SCREEN_USAGE. Touch returns to SCREEN_USAGE.
+static void make_info_row(lv_obj_t* parent, int y, const char* label,
+                          lv_obj_t** out_value) {
+    lv_obj_t* k = lv_label_create(parent);
+    lv_label_set_text(k, label);
+    lv_obj_set_style_text_font(k, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(k, COL_DIM, 0);
+    lv_obj_align(k, LV_ALIGN_TOP_LEFT, L.margin + 16, y);
+
+    *out_value = lv_label_create(parent);
+    lv_label_set_text(*out_value, "—");
+    lv_obj_set_style_text_font(*out_value, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(*out_value, COL_TEXT, 0);
+    lv_obj_align(*out_value, LV_ALIGN_TOP_RIGHT, -(L.margin + 16), y - 3);
+}
+
+static void init_info_screen(lv_obj_t* scr) {
+    info_container = lv_obj_create(scr);
+    lv_obj_set_size(info_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(info_container, 0, 0);
+    lv_obj_set_style_bg_opa(info_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(info_container, 0, 0);
+    lv_obj_set_style_pad_all(info_container, 0, 0);
+    lv_obj_clear_flag(info_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(info_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    // Big clock — Tiempos 56 (largest font we have).
+    lbl_clock = lv_label_create(info_container);
+    lv_label_set_text(lbl_clock, "--:--");
+    lv_obj_set_style_text_font(lbl_clock, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(lbl_clock, COL_TEXT, 0);
+    lv_obj_align(lbl_clock, LV_ALIGN_TOP_MID, 0, 110);
+
+    lbl_date = lv_label_create(info_container);
+    lv_label_set_text(lbl_date, "—");
+    lv_obj_set_style_text_font(lbl_date, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl_date, COL_DIM, 0);
+    lv_obj_align(lbl_date, LV_ALIGN_TOP_MID, 0, 188);
+
+    // Stats panel — 4 rows.
+    lv_obj_t* panel = make_panel(info_container, L.margin,
+                                 250, L.content_w, 160);
+    lv_obj_add_flag(panel, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    make_info_row(panel, 5,   "Week",     &lbl_info_week_v);
+    make_info_row(panel, 41,  "Today",    &lbl_info_today_v);
+    make_info_row(panel, 77,  "Week $",   &lbl_info_wcost_v);
+    make_info_row(panel, 113, "Streak",   &lbl_info_streak_v);
+
+    // Idle hint at the bottom.
+    lbl_info_hint = lv_label_create(info_container);
+    lv_label_set_text(lbl_info_hint, "* Idle");
+    lv_obj_set_style_text_font(lbl_info_hint, &font_mono_32, 0);
+    lv_obj_set_style_text_color(lbl_info_hint, COL_ACCENT, 0);
+    lv_obj_align(lbl_info_hint, LV_ALIGN_BOTTOM_MID, 0, -15);
+
+    lv_obj_add_flag(info_container, LV_OBJ_FLAG_HIDDEN);   // start hidden
+}
+
+static void fmt_tokens_compact(unsigned long n, char* buf, size_t len) {
+    if (n >= 1000000000UL) snprintf(buf, len, "%.2fB", n / 1.0e9);
+    else if (n >= 1000000UL) snprintf(buf, len, "%luM", n / 1000000UL);
+    else if (n >= 1000UL)    snprintf(buf, len, "%.1fk", n / 1000.0);
+    else                     snprintf(buf, len, "%lu", n);
+}
+
+static void fmt_cost_cents(int cents, char* buf, size_t len) {
+    int dollars = cents / 100;
+    int frac    = cents % 100;
+    if (dollars >= 1000) snprintf(buf, len, "$%d", dollars);
+    else                 snprintf(buf, len, "$%d.%02d", dollars, frac);
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -392,6 +486,7 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
+    init_info_screen(scr);   // mateo/info-screen
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -444,12 +539,68 @@ void ui_update(const UsageData* data) {
     } else {
         lv_obj_add_flag(lbl_weekly_delta, LV_OBJ_FLAG_HIDDEN);
     }
+
+    // mateo/info-screen: cache the TZ offset for refresh_info_clock and
+    // refresh the stat values on the idle-clock screen.
+    g_tz_offset_seconds = (long)data->tz_offset_minutes * 60L;
+    if (lbl_info_week_v) {
+        char buf[24];
+        fmt_tokens_compact(data->weekly_tokens, buf, sizeof(buf));
+        lv_label_set_text_fmt(lbl_info_week_v, "%s tok", buf);
+        fmt_cost_cents(data->cost_today_cents, buf, sizeof(buf));
+        lv_label_set_text(lbl_info_today_v, buf);
+        fmt_cost_cents(data->cost_week_cents, buf, sizeof(buf));
+        lv_label_set_text(lbl_info_wcost_v, buf);
+        lv_label_set_text_fmt(lbl_info_streak_v, "%d %s",
+                              data->streak_days,
+                              data->streak_days == 1 ? "day" : "days");
+    }
+}
+
+// mateo/info-screen: refresh the clock/date on the idle screen. Uses
+// settimeofday set by main.cpp on each BLE payload (epoch_seconds from
+// daemon), so the displayed time tracks the Mac's wall-clock without
+// needing NTP. Called every ui_tick_anim invocation while on SCREEN_INFO.
+static void refresh_info_clock(void) {
+    if (!lbl_clock || !lbl_date) return;
+    time_t now_utc = time(NULL);
+    if (now_utc < 1700000000) return;   // RTC not synced yet
+    // settimeofday() set the device clock to UTC; add the daemon's local
+    // offset and then format via gmtime_r — that's the local wall-clock
+    // without needing setenv("TZ") + tzset() gymnastics.
+    time_t local = now_utc + g_tz_offset_seconds;
+    struct tm lt;
+    gmtime_r(&local, &lt);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%02d:%02d", lt.tm_hour, lt.tm_min);
+    lv_label_set_text(lbl_clock, buf);
+    static const char* DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    static const char* MON[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                "Jul","Aug","Sep","Oct","Nov","Dec"};
+    snprintf(buf, sizeof(buf), "%s \xC2\xB7 %s %d",
+             DOW[lt.tm_wday], MON[lt.tm_mon], lt.tm_mday);
+    lv_label_set_text(lbl_date, buf);
 }
 
 void ui_tick_anim(void) {
+    uint32_t now_ms = lv_tick_get();
+
+    // Idle-to-info trigger: after INFO_IDLE_TIMEOUT_MS without a touch on the
+    // Usage screen, switch to the info clock. Reset by global_click_cb.
+    if (current_screen == SCREEN_USAGE &&
+        last_user_touch_ms != 0 &&
+        now_ms - last_user_touch_ms >= INFO_IDLE_TIMEOUT_MS) {
+        ui_show_screen(SCREEN_INFO);
+    }
+
+    if (current_screen == SCREEN_INFO) {
+        refresh_info_clock();
+        return;
+    }
+
     if (current_screen != SCREEN_USAGE) return;
 
-    uint32_t now = lv_tick_get();
+    uint32_t now = now_ms;
 
     if (now - anim_msg_start >= ANIM_MSG_MS) {
         anim_msg_idx = (anim_msg_idx + 1) % ANIM_MSG_COUNT;
@@ -488,17 +639,24 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    // mateo/info-screen: a touch always returns to USAGE and resets the
+    // 60s idle-to-info timer. The old splash-toggle behaviour is preserved
+    // for explicit splash touches.
+    last_user_touch_ms = lv_tick_get();
+    if (current_screen == SCREEN_INFO)   { ui_show_screen(SCREEN_USAGE); return; }
+    if (current_screen == SCREEN_SPLASH) { ui_show_screen(prev_non_splash_screen); return; }
+    ui_show_screen(SCREEN_SPLASH);
 }
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(info_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:  splash_show(); break;
     case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_INFO:    lv_obj_clear_flag(info_container, LV_OBJ_FLAG_HIDDEN);  break;
     default: break;
     }
 
@@ -509,6 +667,7 @@ void ui_show_screen(screen_t screen) {
 
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;
+    last_user_touch_ms = lv_tick_get();  // reset idle timer on any screen change
     apply_battery_visibility();
 }
 

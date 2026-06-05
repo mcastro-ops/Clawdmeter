@@ -434,18 +434,56 @@ async def discover_target(skip_addr: str | None = None):
 # logs at ~/.claude/projects/**/*.jsonl. Files are cached by mtime+size so
 # warm calls cost ~1 ms even with dozens of project dirs.
 # ──────────────────────────────────────────────────────────────────────────
+# Approximate Anthropic public API pricing per million tokens (USD).
+# These are reference rates; users on Pro/Team/Max plans pay a flat fee,
+# so cost shown on the device is "what this would cost on the API".
+# Cache derivatives per docs: cache_read = input × 0.10,
+# cache_creation = input × 1.25 (we don't distinguish 5min vs 1h).
+_PRICES_PER_M = {
+    "opus":   (15.0, 75.0),
+    "sonnet": (3.0, 15.0),
+    "haiku":  (0.80, 4.0),
+}
+
+
+def _prices_for(model: str) -> tuple[float, float]:
+    m = (model or "").lower()
+    if "opus" in m:   return _PRICES_PER_M["opus"]
+    if "haiku" in m:  return _PRICES_PER_M["haiku"]
+    return _PRICES_PER_M["sonnet"]   # default; covers sonnet + unknowns
+
+
+def _record_cost_cents(usage: dict, input_price: float, output_price: float) -> int:
+    inp = int(usage.get("input_tokens") or 0)
+    out = int(usage.get("output_tokens") or 0)
+    cr  = int(usage.get("cache_read_input_tokens") or 0)
+    cw  = int(usage.get("cache_creation_input_tokens") or 0)
+    usd = (
+        inp * input_price        / 1_000_000.0 +
+        out * output_price       / 1_000_000.0 +
+        cr  * input_price * 0.10 / 1_000_000.0 +
+        cw  * input_price * 1.25 / 1_000_000.0
+    )
+    return int(round(usd * 100))
+
+
 class JsonlAggregator:
+    """Per-file mtime-cached aggregator. Each cached record is
+    `(ts_seconds, total_tokens, cost_cents)` — the cost is computed
+    once at parse time using `_PRICES_PER_M`.
+    """
+
     def __init__(self) -> None:
-        # path -> (mtime_ns, size, [(ts_seconds, token_sum), ...])
-        self._cache: dict[Path, tuple[int, int, list[tuple[float, int]]]] = {}
+        # path -> (mtime_ns, size, [(ts, tokens, cents), ...])
+        self._cache: dict[Path, tuple[int, int, list[tuple[float, int, int]]]] = {}
 
     def _list_files(self) -> list[Path]:
         if not PROJECTS_DIR.exists():
             return []
         return list(PROJECTS_DIR.rglob("*.jsonl"))
 
-    def _parse_file(self, path: Path) -> list[tuple[float, int]]:
-        records: list[tuple[float, int]] = []
+    def _parse_file(self, path: Path) -> list[tuple[float, int, int]]:
+        records: list[tuple[float, int, int]] = []
         try:
             text = path.read_text(errors="ignore")
         except OSError:
@@ -476,17 +514,20 @@ class JsonlAggregator:
                 + int(usage.get("cache_read_input_tokens") or 0)
                 + int(usage.get("cache_creation_input_tokens") or 0)
             )
-            if total > 0:
-                records.append((ts, total))
+            if total <= 0:
+                continue
+            ip, op = _prices_for(msg.get("model", ""))
+            cents = _record_cost_cents(usage, ip, op)
+            records.append((ts, total, cents))
         return records
 
-    def _records(self) -> list[tuple[float, int]]:
+    def _records(self) -> list[tuple[float, int, int]]:
         files = self._list_files()
         live = set(files)
         for stale in list(self._cache.keys()):
             if stale not in live:
                 self._cache.pop(stale, None)
-        all_records: list[tuple[float, int]] = []
+        all_records: list[tuple[float, int, int]] = []
         for f in files:
             try:
                 st = f.stat()
@@ -501,26 +542,16 @@ class JsonlAggregator:
             all_records.extend(parsed)
         return all_records
 
+    # ── derived metrics ─────────────────────────────────────────────────
+
     def delta_pct(self, window_end: float | None = None) -> float | None:
-        """Percent change current-7d vs previous-7d, or None if prev is 0.
-
-        When `window_end` is provided (typically Anthropic's
-        `anthropic-ratelimit-unified-7d-reset` timestamp), the boundaries
-        snap to that — current is [end-7d, end], previous is [end-14d, end-7d].
-        This keeps the delta stable across the week and only jumps when
-        the API's weekly reset rolls over, matching the "Resets in Xd Yh"
-        countdown shown on the device.
-
-        Falls back to a rolling 7d window from "now" if window_end is
-        missing or non-positive (e.g. headers absent during a transient
-        API failure).
-        """
+        """Percent change current-7d vs previous-7d, or None if prev is 0."""
         end = window_end if (window_end and window_end > 0) else time.time()
         cutoff_cur = end - WINDOW_7D_SECONDS
         cutoff_prev = cutoff_cur - WINDOW_7D_SECONDS
         cur_sum = 0
         prev_sum = 0
-        for ts, total in self._records():
+        for ts, total, _cents in self._records():
             if ts >= cutoff_cur:
                 cur_sum += total
             elif ts >= cutoff_prev:
@@ -528,6 +559,59 @@ class JsonlAggregator:
         if prev_sum <= 0:
             return None
         return (cur_sum - prev_sum) / prev_sum * 100.0
+
+    def weekly_tokens(self, window_end: float | None = None) -> int:
+        """Total tokens in the same anchored 7d window used by delta_pct."""
+        end = window_end if (window_end and window_end > 0) else time.time()
+        cutoff = end - WINDOW_7D_SECONDS
+        return sum(t for ts, t, _ in self._records() if ts >= cutoff)
+
+    def weekly_cost_cents(self, window_end: float | None = None) -> int:
+        end = window_end if (window_end and window_end > 0) else time.time()
+        cutoff = end - WINDOW_7D_SECONDS
+        return sum(c for ts, _, c in self._records() if ts >= cutoff)
+
+    def daily_cost_cents(self) -> int:
+        """Today's cost, local-time midnight as the lower boundary."""
+        now = time.time()
+        lt = time.localtime(now)
+        midnight_struct = (lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, lt.tm_isdst)
+        cutoff = time.mktime(midnight_struct)
+        return sum(c for ts, _, c in self._records() if ts >= cutoff)
+
+    def streak_days(self) -> int:
+        """Consecutive local-time days, ending today, with ≥1 record.
+        Returns 0 if today has no activity yet (so the streak hasn't started
+        for this day) — we still count today as "in progress" by giving
+        credit if any record exists at all today.
+        """
+        active_days: set[tuple[int, int, int]] = set()
+        for ts, _, _ in self._records():
+            d = time.localtime(ts)
+            active_days.add((d.tm_year, d.tm_mon, d.tm_mday))
+        if not active_days:
+            return 0
+        # Walk backward from today; stop on the first inactive day.
+        today = time.localtime(time.time())
+        cursor = time.mktime((today.tm_year, today.tm_mon, today.tm_mday,
+                              0, 0, 0, 0, 0, today.tm_isdst))
+        streak = 0
+        while True:
+            d = time.localtime(cursor)
+            key = (d.tm_year, d.tm_mon, d.tm_mday)
+            if key in active_days:
+                streak += 1
+                cursor -= 86400.0
+            else:
+                # If today is empty, walk one day back and try again — but
+                # only once, so a still-empty "yesterday" breaks the streak.
+                if streak == 0:
+                    cursor -= 86400.0
+                    d = time.localtime(cursor)
+                    if (d.tm_year, d.tm_mon, d.tm_mday) in active_days:
+                        continue
+                break
+        return streak
 
 
 async def poll_api(token: str, aggregator: "JsonlAggregator | None" = None) -> dict | None:
@@ -570,23 +654,35 @@ async def poll_api(token: str, aggregator: "JsonlAggregator | None" = None) -> d
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
         "ok": True,
     }
-    # mateo/weekly-delta: augment with JSONL-derived delta vs previous 7d,
-    # anchored to Anthropic's actual weekly reset (the same timestamp shown
-    # in the "Resets in Xd Yh" countdown) so the delta is stable through
-    # the week instead of sliding every second.
+    # mateo/weekly-delta: augment with JSONL-derived stats. Window is
+    # anchored to Anthropic's actual weekly reset (matches the "Resets in
+    # Xd Yh" countdown), with rolling-from-now fallback if the header is
+    # missing (transient API failure).
+    payload["t"] = int(time.time())   # epoch seconds, for the idle-clock screen
+    # Local UTC offset in minutes — needed because the device clock is UTC.
+    payload["tz"] = int(time.localtime().tm_gmtoff // 60)
     if aggregator is not None:
         try:
             window_end = float(hdr("anthropic-ratelimit-unified-7d-reset", "0"))
         except (TypeError, ValueError):
             window_end = 0.0
+        we = window_end if window_end > 0 else None
         try:
-            dp = aggregator.delta_pct(window_end=window_end or None)
+            dp = aggregator.delta_pct(window_end=we)
+            wt = aggregator.weekly_tokens(window_end=we)
+            cd = aggregator.daily_cost_cents()
+            cw = aggregator.weekly_cost_cents(window_end=we)
+            ss = aggregator.streak_days()
         except Exception as e:
             log(f"Delta aggregation failed: {e}")
-            dp = None
+            dp = wt = cd = cw = ss = None
         if dp is not None:
             payload["dp"] = round(dp, 1)
             payload["hd"] = True
+        if wt is not None: payload["wt"] = wt          # weekly tokens (int)
+        if cd is not None: payload["cd"] = cd          # cost today, cents
+        if cw is not None: payload["cw"] = cw          # cost week, cents
+        if ss is not None: payload["ss"] = ss          # streak days
     return payload
 
 
