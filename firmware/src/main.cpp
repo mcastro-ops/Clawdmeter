@@ -37,12 +37,67 @@ static UsageData usage = {};
 static uint16_t* buf1 = nullptr;
 static uint16_t* buf2 = nullptr;
 
+// ---- Static CPU rotation (mateo/info-screen tweak) ------------------------
+// 0 = no rotation, 1 = 90° CW, 2 = 180°, 3 = 90° CCW.
+// LVGL stays unaware: my_flush_cb rotates each strip into panel coords,
+// my_touch_cb rotates panel coords back to logical. Lets the user place
+// the device with USB-C coming out the side instead of the bottom.
+// Edit to 0 to disable rotation.
+#define DISPLAY_ROTATION_QUADRANT 3
+#define DISPLAY_PANEL_W 480     // SH8601 on the Waveshare 2.16 — square
+
+#if DISPLAY_ROTATION_QUADRANT != 0
+// Worst-case strip is W × BUF_LINES; after rotation the same pixel count
+// just transposed, so this single buffer covers both 90° quadrants.
+static uint16_t rotation_buf[DISPLAY_PANEL_W * BUF_LINES];
+#endif
+
 static uint32_t my_tick(void) { return millis(); }
 
 static void my_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
     int32_t w = area->x2 - area->x1 + 1;
     int32_t h = area->y2 - area->y1 + 1;
-    display_hal_draw_bitmap(area->x1, area->y1, w, h, (uint16_t*)px_map);
+    uint16_t* src = (uint16_t*)px_map;
+
+#if DISPLAY_ROTATION_QUADRANT == 3
+    // 90° CCW: logical (i, j) → dst (j, w-1-i) in an h×w buffer.
+    // Screen position of the rotated strip:
+    //   panel_x = logical_y
+    //   panel_y = PANEL_W − logical_x − w
+    for (int32_t j = 0; j < h; j++) {
+        const uint16_t* row = src + j * w;
+        for (int32_t i = 0; i < w; i++) {
+            rotation_buf[(w - 1 - i) * h + j] = row[i];
+        }
+    }
+    int32_t px = area->y1;
+    int32_t py = DISPLAY_PANEL_W - area->x1 - w;
+    display_hal_draw_bitmap(px, py, h, w, rotation_buf);
+#elif DISPLAY_ROTATION_QUADRANT == 1
+    // 90° CW: logical (i, j) → dst (h-1-j, i) in an h×w buffer.
+    for (int32_t j = 0; j < h; j++) {
+        const uint16_t* row = src + j * w;
+        for (int32_t i = 0; i < w; i++) {
+            rotation_buf[i * h + (h - 1 - j)] = row[i];
+        }
+    }
+    int32_t px = DISPLAY_PANEL_W - area->y1 - h;
+    int32_t py = area->x1;
+    display_hal_draw_bitmap(px, py, h, w, rotation_buf);
+#elif DISPLAY_ROTATION_QUADRANT == 2
+    // 180°: easier — same dimensions, just flip both axes within the strip.
+    for (int32_t j = 0; j < h; j++) {
+        const uint16_t* row = src + j * w;
+        uint16_t* dst = rotation_buf + (h - 1 - j) * w;
+        for (int32_t i = 0; i < w; i++) dst[w - 1 - i] = row[i];
+    }
+    int32_t px = DISPLAY_PANEL_W - area->x1 - w;
+    int32_t py = DISPLAY_PANEL_W - area->y1 - h;
+    display_hal_draw_bitmap(px, py, w, h, rotation_buf);
+#else
+    display_hal_draw_bitmap(area->x1, area->y1, w, h, src);
+#endif
+
     lv_display_flush_ready(disp);
 }
 
@@ -89,8 +144,24 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 
     if (pressed) {
+        // Invert the rotation applied in my_flush_cb so logical coords
+        // arrive correctly at LVGL.
+#if DISPLAY_ROTATION_QUADRANT == 3
+        // 90° CCW content → panel (px, py) maps to logical (PANEL_W-1-py, px).
+        data->point.x = DISPLAY_PANEL_W - 1 - y;
+        data->point.y = x;
+#elif DISPLAY_ROTATION_QUADRANT == 1
+        // 90° CW content → panel (px, py) maps to logical (py, PANEL_W-1-px).
+        data->point.x = y;
+        data->point.y = DISPLAY_PANEL_W - 1 - x;
+#elif DISPLAY_ROTATION_QUADRANT == 2
+        // 180° content → flip both axes.
+        data->point.x = DISPLAY_PANEL_W - 1 - x;
+        data->point.y = DISPLAY_PANEL_W - 1 - y;
+#else
         data->point.x = x;
         data->point.y = y;
+#endif
         data->state = LV_INDEV_STATE_PRESSED;
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
