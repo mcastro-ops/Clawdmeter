@@ -16,6 +16,7 @@ LV_FONT_DECLARE(font_styrene_20);
 LV_FONT_DECLARE(font_styrene_16);
 LV_FONT_DECLARE(font_styrene_14);
 LV_FONT_DECLARE(font_mono_32);
+LV_FONT_DECLARE(font_mono_96);   // mateo/info-screen: big clock face
 
 // Layout values computed from the active board's geometry. Populated once
 // in ui_init() and treated as const for the rest of the program. Adding a
@@ -424,18 +425,21 @@ static void init_info_screen(lv_obj_t* scr) {
     lv_obj_clear_flag(info_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(info_container, global_click_cb, LV_EVENT_CLICKED, NULL);
 
-    // Big clock — Tiempos 56 (largest font we have).
+    // Big clock — DejaVu Sans Mono 96. Mono gives the digital-watch feel
+    // and contrasts deliberately with the Tiempos/Styrene used everywhere
+    // else. ~96 px tall, ~290 px wide for "HH:MM" — fits the 480 width
+    // with margin and dominates the upper half of the screen.
     lbl_clock = lv_label_create(info_container);
     lv_label_set_text(lbl_clock, "--:--");
-    lv_obj_set_style_text_font(lbl_clock, &font_tiempos_56, 0);
+    lv_obj_set_style_text_font(lbl_clock, &font_mono_96, 0);
     lv_obj_set_style_text_color(lbl_clock, COL_TEXT, 0);
-    lv_obj_align(lbl_clock, LV_ALIGN_TOP_MID, 0, 110);
+    lv_obj_align(lbl_clock, LV_ALIGN_TOP_MID, 0, 80);
 
     lbl_date = lv_label_create(info_container);
     lv_label_set_text(lbl_date, "—");
     lv_obj_set_style_text_font(lbl_date, &font_styrene_28, 0);
     lv_obj_set_style_text_color(lbl_date, COL_DIM, 0);
-    lv_obj_align(lbl_date, LV_ALIGN_TOP_MID, 0, 188);
+    lv_obj_align(lbl_date, LV_ALIGN_TOP_MID, 0, 200);
 
     // Stats panel — 2 rows (cost removed; not real on a flat-fee plan).
     // Panel kept at 160 px so the visual weight matches the clock above;
