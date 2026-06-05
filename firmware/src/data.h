@@ -14,4 +14,12 @@ struct UsageData {
     // history). Null/missing for the first week of use.
     float delta_pct;
     bool has_delta;
+    // mateo/info-screen patch: extras for the idle clock screen. All
+    // optional — info screen falls back to placeholders if missing.
+    unsigned long epoch_seconds;   // unix time (UTC), for the clock + RTC sync
+    int tz_offset_minutes;         // local UTC offset in minutes (e.g. -180 AR)
+    unsigned long weekly_tokens;   // total tokens in the anchored 7d window
+    int cost_today_cents;          // local-time today
+    int cost_week_cents;           // same window as weekly_tokens
+    int streak_days;               // consecutive days with activity, ending today
 };

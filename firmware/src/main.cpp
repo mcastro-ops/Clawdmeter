@@ -3,6 +3,7 @@
 #include <lvgl.h>
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
+#include <sys/time.h>      // mateo/info-screen: settimeofday for RTC sync
 
 #include "data.h"
 #include "ui.h"
@@ -115,6 +116,21 @@ static bool parse_json(const char* json, UsageData* out) {
     // previous week of JSONL data exists.
     out->has_delta = doc["hd"] | false;
     out->delta_pct = doc["dp"] | 0.0f;
+    // mateo/info-screen: optional extras for the idle clock screen.
+    out->epoch_seconds     = doc["t"]  | 0UL;
+    out->tz_offset_minutes = doc["tz"] | 0;
+    out->weekly_tokens     = doc["wt"] | 0UL;
+    out->cost_today_cents  = doc["cd"] | 0;
+    out->cost_week_cents   = doc["cw"] | 0;
+    out->streak_days       = doc["ss"] | 0;
+    // Sync the system clock from the daemon's epoch so the info screen's
+    // clock matches the Mac's wall-clock. Re-applied every poll to bound
+    // drift; the timezone defaults to UTC unless TZ has been set, so we
+    // also set the TZ to localtime via setenv in setup() (see board_init).
+    if (out->epoch_seconds > 1700000000UL) {
+        struct timeval tv = { (time_t)out->epoch_seconds, 0 };
+        settimeofday(&tv, NULL);
+    }
     out->valid = true;
     return true;
 }
