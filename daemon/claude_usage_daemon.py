@@ -501,15 +501,27 @@ class JsonlAggregator:
             all_records.extend(parsed)
         return all_records
 
-    def delta_pct(self) -> float | None:
-        """Percent change current-7d vs previous-7d, or None if prev is 0."""
-        now = time.time()
-        cutoff_now = now - WINDOW_7D_SECONDS
-        cutoff_prev = cutoff_now - WINDOW_7D_SECONDS
+    def delta_pct(self, window_end: float | None = None) -> float | None:
+        """Percent change current-7d vs previous-7d, or None if prev is 0.
+
+        When `window_end` is provided (typically Anthropic's
+        `anthropic-ratelimit-unified-7d-reset` timestamp), the boundaries
+        snap to that — current is [end-7d, end], previous is [end-14d, end-7d].
+        This keeps the delta stable across the week and only jumps when
+        the API's weekly reset rolls over, matching the "Resets in Xd Yh"
+        countdown shown on the device.
+
+        Falls back to a rolling 7d window from "now" if window_end is
+        missing or non-positive (e.g. headers absent during a transient
+        API failure).
+        """
+        end = window_end if (window_end and window_end > 0) else time.time()
+        cutoff_cur = end - WINDOW_7D_SECONDS
+        cutoff_prev = cutoff_cur - WINDOW_7D_SECONDS
         cur_sum = 0
         prev_sum = 0
         for ts, total in self._records():
-            if ts >= cutoff_now:
+            if ts >= cutoff_cur:
                 cur_sum += total
             elif ts >= cutoff_prev:
                 prev_sum += total
@@ -558,10 +570,17 @@ async def poll_api(token: str, aggregator: "JsonlAggregator | None" = None) -> d
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
         "ok": True,
     }
-    # mateo/weekly-delta: augment with JSONL-derived delta vs previous 7d.
+    # mateo/weekly-delta: augment with JSONL-derived delta vs previous 7d,
+    # anchored to Anthropic's actual weekly reset (the same timestamp shown
+    # in the "Resets in Xd Yh" countdown) so the delta is stable through
+    # the week instead of sliding every second.
     if aggregator is not None:
         try:
-            dp = aggregator.delta_pct()
+            window_end = float(hdr("anthropic-ratelimit-unified-7d-reset", "0"))
+        except (TypeError, ValueError):
+            window_end = 0.0
+        try:
+            dp = aggregator.delta_pct(window_end=window_end or None)
         except Exception as e:
             log(f"Delta aggregation failed: {e}")
             dp = None
