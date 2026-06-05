@@ -428,16 +428,16 @@ void ui_update(const UsageData* data) {
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
 
-    // mateo/weekly-delta: ▲ amber for more usage than last week, ▼ green
-    // for less. font_styrene_24 was regenerated with DejaVu fallback for
-    // U+25B2/U+25BC since Styrene Regular doesn't include those glyphs.
-    // Clamps the display at ±999% to avoid layout blowout.
+    // mateo/weekly-delta: ▲ green for more usage than last week (productive!)
+    // ▼ amber for less (idler week). font_styrene_24 was regenerated with
+    // DejaVu fallback for U+25B2/U+25BC since Styrene Regular doesn't ship
+    // those glyphs. Clamps the display at ±999% to avoid layout blowout.
     if (data->has_delta) {
         int dp = (int)(data->delta_pct + (data->delta_pct >= 0 ? 0.5f : -0.5f));
         if (dp > 999) dp = 999;
         if (dp < -999) dp = -999;
         const char* arrow = (data->delta_pct >= 0) ? "\xE2\x96\xB2" : "\xE2\x96\xBC"; // ▲ / ▼
-        lv_color_t col = (data->delta_pct >= 0) ? COL_AMBER : COL_GREEN;
+        lv_color_t col = (data->delta_pct >= 0) ? COL_GREEN : COL_AMBER;
         lv_label_set_text_fmt(lbl_weekly_delta, "%s %d%%", arrow, dp < 0 ? -dp : dp);
         lv_obj_set_style_text_color(lbl_weekly_delta, col, 0);
         lv_obj_clear_flag(lbl_weekly_delta, LV_OBJ_FLAG_HIDDEN);

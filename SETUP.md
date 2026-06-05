@@ -129,8 +129,9 @@ The OAuth refresh and delta features go away; the rest still works.
 └─────────────────────────────┘
 ```
 
-▲ amber for more usage than last week, ▼ green for less. Hidden during
-your first week of Claude Code use (no prev-7d data yet).
+▲ green for more usage than last week (productive!), ▼ amber for less
+(idler week). Hidden during your first week of Claude Code use (no
+prev-7d data yet).
 
 ## Upstream sync
 
