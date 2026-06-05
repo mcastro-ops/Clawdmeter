@@ -121,8 +121,6 @@ static lv_obj_t* info_container;
 static lv_obj_t* lbl_clock;
 static lv_obj_t* lbl_date;
 static lv_obj_t* lbl_info_week_v;
-static lv_obj_t* lbl_info_today_v;
-static lv_obj_t* lbl_info_wcost_v;
 static lv_obj_t* lbl_info_streak_v;
 static lv_obj_t* lbl_info_hint;
 // Idle→info trigger: switch to SCREEN_INFO after this many ms with no touch.
@@ -439,15 +437,15 @@ static void init_info_screen(lv_obj_t* scr) {
     lv_obj_set_style_text_color(lbl_date, COL_DIM, 0);
     lv_obj_align(lbl_date, LV_ALIGN_TOP_MID, 0, 188);
 
-    // Stats panel — 4 rows.
+    // Stats panel — 2 rows (cost removed; not real on a flat-fee plan).
+    // Panel kept at 160 px so the visual weight matches the clock above;
+    // the two rows sit centered with extra breathing room.
     lv_obj_t* panel = make_panel(info_container, L.margin,
                                  250, L.content_w, 160);
     lv_obj_add_flag(panel, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    make_info_row(panel, 5,   "Week",     &lbl_info_week_v);
-    make_info_row(panel, 41,  "Today",    &lbl_info_today_v);
-    make_info_row(panel, 77,  "Week $",   &lbl_info_wcost_v);
-    make_info_row(panel, 113, "Streak",   &lbl_info_streak_v);
+    make_info_row(panel, 30, "Week",   &lbl_info_week_v);
+    make_info_row(panel, 80, "Streak", &lbl_info_streak_v);
 
     // Idle hint at the bottom.
     lbl_info_hint = lv_label_create(info_container);
@@ -547,10 +545,6 @@ void ui_update(const UsageData* data) {
         char buf[24];
         fmt_tokens_compact(data->weekly_tokens, buf, sizeof(buf));
         lv_label_set_text_fmt(lbl_info_week_v, "%s tok", buf);
-        fmt_cost_cents(data->cost_today_cents, buf, sizeof(buf));
-        lv_label_set_text(lbl_info_today_v, buf);
-        fmt_cost_cents(data->cost_week_cents, buf, sizeof(buf));
-        lv_label_set_text(lbl_info_wcost_v, buf);
         lv_label_set_text_fmt(lbl_info_streak_v, "%d %s",
                               data->streak_days,
                               data->streak_days == 1 ? "day" : "days");
@@ -577,7 +571,9 @@ static void refresh_info_clock(void) {
     static const char* DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     static const char* MON[] = {"Jan","Feb","Mar","Apr","May","Jun",
                                 "Jul","Aug","Sep","Oct","Nov","Dec"};
-    snprintf(buf, sizeof(buf), "%s \xC2\xB7 %s %d",
+    // ASCII-only separator — Styrene 28 isn't compiled with U+00B7 (·) so
+    // any Unicode middle-dot would render as a tofu rectangle. Comma it is.
+    snprintf(buf, sizeof(buf), "%s, %s %d",
              DOW[lt.tm_wday], MON[lt.tm_mon], lt.tm_mday);
     lv_label_set_text(lbl_date, buf);
 }
