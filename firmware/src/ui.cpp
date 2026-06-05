@@ -433,13 +433,15 @@ static void init_info_screen(lv_obj_t* scr) {
     lv_label_set_text(lbl_clock, "--:--");
     lv_obj_set_style_text_font(lbl_clock, &font_mono_96, 0);
     lv_obj_set_style_text_color(lbl_clock, COL_TEXT, 0);
-    lv_obj_align(lbl_clock, LV_ALIGN_TOP_MID, 0, 80);
+    // y=110 puts the clock top ~10 px below the logo's bottom (logo top
+    // is at title_y-10 = 20, logo is 80×80, so logo bottom ≈ 100).
+    lv_obj_align(lbl_clock, LV_ALIGN_TOP_MID, 0, 110);
 
     lbl_date = lv_label_create(info_container);
     lv_label_set_text(lbl_date, "—");
     lv_obj_set_style_text_font(lbl_date, &font_styrene_28, 0);
     lv_obj_set_style_text_color(lbl_date, COL_DIM, 0);
-    lv_obj_align(lbl_date, LV_ALIGN_TOP_MID, 0, 200);
+    lv_obj_align(lbl_date, LV_ALIGN_TOP_MID, 0, 215);
 
     // Stats panel — 2 rows (cost removed; not real on a flat-fee plan).
     // Panel kept at 160 px so the visual weight matches the clock above;
